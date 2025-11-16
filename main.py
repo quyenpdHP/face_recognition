@@ -7,6 +7,10 @@ import os.path as osp
 
 import torch
 import cv2
+from skimage import transform as trans
+import numpy as np
+
+from backbones import get_model
 
 ROOT = os.getcwd()
 if str(ROOT) not in sys.path:
@@ -69,6 +73,42 @@ def draw_face_box_and_landmarks(image, box, landmarks, box_color=(0, 255, 0), la
 
     return image
 
+def align_face_by_landmarks(image, landmarks):
+    """
+    Căn chỉnh khuôn mặt dựa trên 5 điểm landmarks.
+    Args:
+        image: Ảnh đầu vào dạng numpy array (BGR).
+        landmarks: numpy array shape (5, 2), tọa độ 5 điểm landmark.
+    Returns:
+        input_blob: numpy array shape (2, 3, 112, 112), gồm ảnh căn chỉnh và ảnh lật ngang.
+    """
+    image_size = (112, 112)
+    src = np.array([
+        [30.2946, 51.6963],
+        [65.5318, 51.5014],
+        [48.0252, 71.7366],
+        [33.5493, 92.3655],
+        [62.7299, 92.2041]], dtype=np.float32)
+    src[:, 0] += 8.0
+
+    tform = trans.SimilarityTransform()
+    tform.estimate(landmarks, src)
+    M = tform.params[0:2, :]
+    aligned = cv2.warpAffine(image, M, image_size, borderValue=0.0)
+    aligned = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB)
+    aligned = np.transpose(aligned, (2, 0, 1))
+    aligned_cv2 = cv2.cvtColor(np.transpose(aligned, (1, 2, 0)), cv2.COLOR_RGB2BGR)
+    return aligned_cv2
+
+@torch.no_grad()
+def inference_arcface(net, img):
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = np.transpose(img, (2, 0, 1))
+    img = torch.from_numpy(img).unsqueeze(0).float()
+    img.div_(255).sub_(0.5).div_(0.5)
+    feat = net(img).numpy()
+    return feat
+
 @torch.no_grad()
 def run(weights=osp.join(ROOT, 'yolov6s_face.pt'),
         source=osp.join(ROOT, 'data/images'),
@@ -130,16 +170,25 @@ def run(weights=osp.join(ROOT, 'yolov6s_face.pt'),
         if not osp.exists(save_txt_path):
             os.makedirs(save_txt_path)
 
-    # Inference
+    # Inference face detect
     inferer = Inferer(source, webcam, webcam_addr, weights, device, yaml, img_size, half)  
     result_detections = inferer.infer(conf_thres, iou_thres, classes, agnostic_nms, max_det, save_dir, save_txt, not not_save_img, hide_labels, hide_conf, view_img, save_txt_widerface)
 
+    # Inference arcface - face emnbedding
+    net = get_model('r50', fp16=False)
+    # If use GPU, use bellow code
+    # net.load_state_dict(torch.load(weight))
+    net.load_state_dict(torch.load('weights/ms1mv3_arcface_r50_fp16.pth', map_location=torch.device('cpu')))
+    net.eval()
     image_show = cv2.imread("data/images/image1.jpg")
     for det_img in result_detections:
         for det in det_img:
-          xyxy, conf, lmdks = det
-          image_show = draw_face_box_and_landmarks(image_show, xyxy, lmdks)
-        #   print(f'Box: {xyxy}, Conf: {conf}, Landmarks: {lmdks}')
+            xyxy, conf, lmdks = det
+            lmdks = np.array(lmdks).reshape((5, 2))
+            input_blob = align_face_by_landmarks(image_show, lmdks)
+            features = inference_arcface(net, input_blob)
+            # print("Face embedding:", features)
+            cv2.imwrite("aligned_face.jpg", input_blob)
     cv2.imwrite("result_with_landmarks.jpg", image_show)
     LOGGER.info(f"Result with landmarks saved to result_with_landmarks.jpg")
 
